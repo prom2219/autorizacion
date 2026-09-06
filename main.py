@@ -222,6 +222,11 @@ def health():
     return {"status": "ok", "service": "sipp-authorization"}
 
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "sipp-authorization", "message": "Servidor activo."}
+
+
 @app.post("/v1/terms-acceptances")
 def registrar_aceptacion_condiciones(datos: TermsAcceptance):
     try:
