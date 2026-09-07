@@ -5,11 +5,11 @@ import json
 import logging
 import os
 import secrets
-import smtplib
 import uuid
-from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 import psycopg
 from fastapi import FastAPI, HTTPException
@@ -22,18 +22,6 @@ app = FastAPI(title="SiPP Authorization API", version="2.3.0")
 CODE_MINUTES = 10
 ACTION_MINUTES = 7 * 24 * 60
 AUTH_CODE_SECRET_LOCAL = "configure-AUTH_CODE_SECRET-en-Render"
-
-
-def configuracion_correo():
-    servidor_smtp = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    puerto_smtp = int(os.getenv("SMTP_PORT", "587"))
-    cuenta_smtp = os.getenv("SMTP_USER", "").strip()
-    contraseña_smtp = os.getenv("SMTP_PASSWORD", "").strip()
-    remitente = os.getenv("SMTP_FROM", cuenta_smtp).strip()
-    destinatario = os.getenv("SMTP_TO", "").strip()
-    if not cuenta_smtp or not contraseña_smtp or not remitente or not destinatario:
-        raise RuntimeError("Configure SMTP_USER, SMTP_PASSWORD, SMTP_FROM y SMTP_TO.")
-    return servidor_smtp, puerto_smtp, cuenta_smtp, contraseña_smtp, remitente, destinatario
 
 
 class AccessRequest(BaseModel):
@@ -106,22 +94,42 @@ def enlace_accion(request_id, token, accion):
 
 
 def enviar_mensaje(asunto, texto, html_cuerpo):
-    servidor_smtp, puerto_smtp, cuenta_smtp, contraseña_smtp, remitente, destinatario = configuracion_correo()
-    mensaje = EmailMessage()
-    mensaje["From"] = remitente
-    mensaje["To"] = destinatario
-    mensaje["Subject"] = asunto
-    mensaje.set_content(texto)
-    mensaje.add_alternative(html_cuerpo, subtype="html")
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    remitente = os.getenv("MAIL_FROM", "").strip()
+    destinatario = os.getenv("MAIL_TO", "").strip()
+    if not api_key or not remitente or not destinatario:
+        raise RuntimeError("Configure RESEND_API_KEY, MAIL_FROM y MAIL_TO.")
+    cuerpo = json.dumps(
+        {
+            "from": remitente,
+            "to": [destinatario],
+            "subject": asunto,
+            "text": texto,
+            "html": html_cuerpo,
+        }
+    ).encode("utf-8")
+    solicitud = Request(
+        "https://api.resend.com/emails",
+        data=cuerpo,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
     try:
-        conexion_smtp = smtplib.SMTP_SSL if puerto_smtp == 465 else smtplib.SMTP
-        with conexion_smtp(servidor_smtp, puerto_smtp, timeout=15) as conexion:
-            if puerto_smtp != 465:
-                conexion.starttls()
-            conexion.login(cuenta_smtp, contraseña_smtp)
-            conexion.send_message(mensaje)
-    except (OSError, smtplib.SMTPException) as exc:
-        raise RuntimeError(f"No se pudo enviar el correo SMTP: {exc}") from exc
+        with urlopen(solicitud, timeout=20) as respuesta:
+            if respuesta.status not in (200, 201):
+                raise RuntimeError(f"Resend devolvio HTTP {respuesta.status}.")
+    except HTTPError as exc:
+        try:
+            detalle = json.loads(exc.read().decode("utf-8")).get("message", "")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            detalle = ""
+        raise RuntimeError(f"Resend devolvio HTTP {exc.code}: {detalle}") from exc
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        raise RuntimeError(f"No se pudo contactar la API de Resend: {exc}") from exc
 
 
 def fila_a_respuesta(fila):
@@ -308,7 +316,7 @@ def crear_solicitud(datos: AccessRequest):
             enviar_correo(datos, request_id, code, expires_at, token)
         except RuntimeError as exc:
             logging.exception("No se pudo enviar el codigo por correo")
-            raise HTTPException(status_code=503, detail="No se pudo enviar el codigo por correo SMTP.") from exc
+            raise HTTPException(status_code=503, detail="No se pudo enviar el codigo por correo.") from exc
         respuesta = fila_a_respuesta((request_id, "PENDIENTE", expires_at))
         return respuesta
     except HTTPException:
