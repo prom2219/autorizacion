@@ -135,10 +135,11 @@ def fila_a_respuesta(fila):
 
 def enviar_correo(datos, request_id, code, expires_at):
     if os.getenv("BREVO_API_KEY", "").strip():
-        remitente = SMTP_EMAIL_LOCAL
+        remitente = os.getenv("SMTP_FROM", SMTP_EMAIL_LOCAL)
+        destinatario = os.getenv("SMTP_TO", SMTP_EMAIL_LOCAL)
         cuerpo = f"Codigo de autorizacion: {code}. Caduca en {CODE_MINUTES} minutos."
         html_cuerpo = f"<h2>Solicitud de acceso a SiPP</h2><p><strong>Codigo de autorizacion: {html.escape(code)}</strong></p><p>Caduca en {CODE_MINUTES} minutos.</p>"
-        enviar_correo_brevo_api(f"SiPP: solicitud de acceso ({datos.device_name})", cuerpo, html_cuerpo, remitente, remitente)
+        enviar_correo_brevo_api(f"SiPP: solicitud de acceso ({datos.device_name})", cuerpo, html_cuerpo, remitente, destinatario)
         return
     servidor_smtp, puerto_smtp, cuenta_smtp, contraseña_smtp, remitente, destinatario = configuracion_correo()
     cuerpo = f"""
@@ -270,17 +271,16 @@ def crear_solicitud(datos: AccessRequest):
                     (request_id, datos.installation_id, datos.device_name, datos.windows_user,
                      datos.operating_system, datos.app_version, codigo_hash(request_id, code), expires_at),
                 )
-        correo_enviado = True
         if not MODO_LOCAL_SIN_CORREO:
             try:
                 enviar_correo(datos, request_id, code, expires_at)
-            except RuntimeError:
-                correo_enviado = False
-                logging.warning("No se envio el correo; se muestra el codigo en modo local.")
+            except RuntimeError as exc:
+                logging.exception("No se pudo enviar el codigo por correo")
+                raise HTTPException(
+                    status_code=503,
+                    detail="No se pudo enviar el codigo por correo. Configure Brevo en el servicio.",
+                ) from exc
         respuesta = fila_a_respuesta((request_id, "PENDIENTE", expires_at))
-        if not correo_enviado:
-            respuesta["code"] = code
-            respuesta["message"] = "Modo local: use el codigo mostrado en SiPP."
         return respuesta
     except HTTPException:
         raise
