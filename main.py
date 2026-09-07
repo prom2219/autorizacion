@@ -9,62 +9,31 @@ import smtplib
 import uuid
 from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
-from urllib.request import Request, urlopen
+from urllib.parse import quote
 
 import psycopg
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 
 logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="SiPP Authorization API", version="2.3.0")
 CODE_MINUTES = 10
-AUTH_CODE_SECRET_LOCAL = "sipp-local-auth-secret-2.3"
-SMTP_HOST_LOCAL = "smtp-relay.brevo.com"
-SMTP_PORT_LOCAL = 587
-SMTP_USER_LOCAL = "b81263001@smtp-brevo.com"
-SMTP_EMAIL_LOCAL = "prom2219zip@gmail.com"
-MODO_LOCAL_SIN_CORREO = False
-BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
+ACTION_MINUTES = 7 * 24 * 60
+AUTH_CODE_SECRET_LOCAL = "configure-AUTH_CODE_SECRET-en-Render"
 
 
 def configuracion_correo():
-    servidor_smtp = os.getenv("SMTP_HOST", SMTP_HOST_LOCAL)
-    puerto_smtp = int(os.getenv("SMTP_PORT", str(SMTP_PORT_LOCAL)))
-    cuenta_smtp = os.getenv("SMTP_USER", SMTP_USER_LOCAL)
+    servidor_smtp = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    puerto_smtp = int(os.getenv("SMTP_PORT", "587"))
+    cuenta_smtp = os.getenv("SMTP_USER", "").strip()
     contraseña_smtp = os.getenv("SMTP_PASSWORD", "").strip()
-    remitente = os.getenv("SMTP_FROM", SMTP_EMAIL_LOCAL)
-    destinatario = os.getenv("SMTP_TO", SMTP_EMAIL_LOCAL)
-    if not contraseña_smtp:
-        raise RuntimeError("Configure SMTP_PASSWORD.")
+    remitente = os.getenv("SMTP_FROM", cuenta_smtp).strip()
+    destinatario = os.getenv("SMTP_TO", "").strip()
+    if not cuenta_smtp or not contraseña_smtp or not remitente or not destinatario:
+        raise RuntimeError("Configure SMTP_USER, SMTP_PASSWORD, SMTP_FROM y SMTP_TO.")
     return servidor_smtp, puerto_smtp, cuenta_smtp, contraseña_smtp, remitente, destinatario
-
-
-def enviar_correo_brevo_api(asunto, texto, html_cuerpo, remitente, destinatario):
-    api_key = os.getenv("BREVO_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("Configure BREVO_API_KEY.")
-    cuerpo = json.dumps(
-        {
-            "sender": {"email": remitente},
-            "to": [{"email": destinatario}],
-            "subject": asunto,
-            "textContent": texto,
-            "htmlContent": html_cuerpo,
-        }
-    ).encode("utf-8")
-    solicitud = Request(
-        BREVO_API_URL,
-        data=cuerpo,
-        headers={"accept": "application/json", "api-key": api_key, "content-type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(solicitud, timeout=15) as respuesta:
-            if respuesta.status not in (200, 201, 202):
-                raise RuntimeError(f"Brevo API devolvio HTTP {respuesta.status}.")
-    except Exception as exc:
-        raise RuntimeError(f"No se pudo enviar el correo por Brevo API: {exc}") from exc
 
 
 class AccessRequest(BaseModel):
@@ -124,6 +93,37 @@ def codigo_hash(request_id, code):
     return hmac.new(secret.encode("utf-8"), mensaje, hashlib.sha256).hexdigest()
 
 
+def token_hash(token):
+    secret = os.getenv("ADMIN_ACTION_SECRET", AUTH_CODE_SECRET_LOCAL)
+    return hmac.new(secret.encode("utf-8"), token.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def enlace_accion(request_id, token, accion):
+    base = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if not base:
+        raise RuntimeError("Configure PUBLIC_BASE_URL.")
+    return f"{base}/admin/access-requests/{request_id}/{accion}?token={quote(token)}"
+
+
+def enviar_mensaje(asunto, texto, html_cuerpo):
+    servidor_smtp, puerto_smtp, cuenta_smtp, contraseña_smtp, remitente, destinatario = configuracion_correo()
+    mensaje = EmailMessage()
+    mensaje["From"] = remitente
+    mensaje["To"] = destinatario
+    mensaje["Subject"] = asunto
+    mensaje.set_content(texto)
+    mensaje.add_alternative(html_cuerpo, subtype="html")
+    try:
+        conexion_smtp = smtplib.SMTP_SSL if puerto_smtp == 465 else smtplib.SMTP
+        with conexion_smtp(servidor_smtp, puerto_smtp, timeout=15) as conexion:
+            if puerto_smtp != 465:
+                conexion.starttls()
+            conexion.login(cuenta_smtp, contraseña_smtp)
+            conexion.send_message(mensaje)
+    except (OSError, smtplib.SMTPException) as exc:
+        raise RuntimeError(f"No se pudo enviar el correo SMTP: {exc}") from exc
+
+
 def fila_a_respuesta(fila):
     return {
         "request_id": str(fila[0]),
@@ -133,44 +133,31 @@ def fila_a_respuesta(fila):
     }
 
 
-def enviar_correo(datos, request_id, code, expires_at):
-    if os.getenv("BREVO_API_KEY", "").strip():
-        remitente = os.getenv("SMTP_FROM", SMTP_EMAIL_LOCAL)
-        destinatario = os.getenv("SMTP_TO", SMTP_EMAIL_LOCAL)
-        cuerpo = f"Codigo de autorizacion: {code}. Caduca en {CODE_MINUTES} minutos."
-        html_cuerpo = f"<h2>Solicitud de acceso a SiPP</h2><p><strong>Codigo de autorizacion: {html.escape(code)}</strong></p><p>Caduca en {CODE_MINUTES} minutos.</p>"
-        enviar_correo_brevo_api(f"SiPP: solicitud de acceso ({datos.device_name})", cuerpo, html_cuerpo, remitente, destinatario)
-        return
-    servidor_smtp, puerto_smtp, cuenta_smtp, contraseña_smtp, remitente, destinatario = configuracion_correo()
-    cuerpo = f"""
+def enviar_correo(datos, request_id, code, expires_at, token):
+    aprobacion = enlace_accion(request_id, token, "aprobar")
+    rechazo = enlace_accion(request_id, token, "rechazar")
+    bloqueo = enlace_accion(request_id, token, "bloquear")
+    desbloqueo = enlace_accion(request_id, token, "desbloquear")
+    detalles = (
+        f"Equipo: {datos.device_name}\nUsuario: {datos.windows_user}\n"
+        f"Sistema: {datos.operating_system}\nIdentificador: {datos.installation_id}\n"
+        f"Codigo: {code}\nCaduca: {expires_at.isoformat()}"
+    )
+    html_cuerpo = f"""
     <h2>Solicitud de acceso a SiPP</h2>
     <p>Una computadora solicita permiso para usar SiPP.</p>
-    <ul>
-      <li>Equipo: {html.escape(datos.device_name)}</li>
-      <li>Usuario: {html.escape(datos.windows_user)}</li>
-      <li>Sistema: {html.escape(datos.operating_system)}</li>
-      <li>Version: {html.escape(datos.app_version)}</li>
-      <li>Identificador: {html.escape(datos.installation_id)}</li>
-    </ul>
-    <p><strong>Codigo de autorizacion: {html.escape(code)}</strong></p>
-    <p>El codigo caduca en {CODE_MINUTES} minutos y solo puede usarse una vez.</p>
-    <p>Caduca: {html.escape(expires_at.isoformat())}</p>
+    <p><strong>Equipo:</strong> {html.escape(datos.device_name)}<br>
+    <strong>Usuario:</strong> {html.escape(datos.windows_user)}<br>
+    <strong>Sistema:</strong> {html.escape(datos.operating_system)}<br>
+    <strong>Identificador:</strong> {html.escape(datos.installation_id)}</p>
+    <p>Codigo para el usuario: <strong>{html.escape(code)}</strong></p>
+    <p>Acciones administrativas:</p>
+    <p><a href="{html.escape(aprobacion)}">APROBAR</a> | <a href="{html.escape(rechazo)}">RECHAZAR</a></p>
+    <p><a href="{html.escape(bloqueo)}">BLOQUEAR EQUIPO</a> | <a href="{html.escape(desbloqueo)}">DESBLOQUEAR EQUIPO</a></p>
+    <p>Los enlaces caducan en {ACTION_MINUTES // 1440} dias.</p>
     """
-    mensaje = EmailMessage()
-    mensaje["From"] = remitente
-    mensaje["To"] = destinatario
-    mensaje["Subject"] = f"SiPP: solicitud de acceso ({datos.device_name})"
-    mensaje.set_content("Su cliente de correo no admite HTML.")
-    mensaje.add_alternative(cuerpo, subtype="html")
-    try:
-        conexion_smtp = smtplib.SMTP_SSL if puerto_smtp == 465 else smtplib.SMTP
-        with conexion_smtp(servidor_smtp, puerto_smtp, timeout=15) as conexion:
-            if puerto_smtp != 465:
-                conexion.starttls()
-            conexion.login(cuenta_smtp, contraseña_smtp)
-            conexion.send_message(mensaje)
-    except (OSError, smtplib.SMTPException) as exc:
-        raise RuntimeError(f"No se pudo enviar el correo de autorizacion: {exc}") from exc
+    enviar_mensaje(f"SiPP: solicitud de acceso ({datos.device_name})", detalles, html_cuerpo)
+    return token
 
 
 def enviar_correo_aceptacion(datos):
@@ -188,34 +175,9 @@ def enviar_correo_aceptacion(datos):
       <li>Identificador: {html.escape(datos.installation_id)}</li>
     </ul>
     """
-    if os.getenv("BREVO_API_KEY", "").strip():
-        html_cuerpo = f"<h2>Aceptacion de condiciones de SiPP</h2><h3>Equipo que accedio</h3>{detalles_equipo}<pre>{html.escape(datos.terms_text)}</pre>"
-        enviar_correo_brevo_api("SiPP: condiciones aceptadas", "Se aceptaron las condiciones de uso de SiPP.", html_cuerpo, SMTP_EMAIL_LOCAL, SMTP_EMAIL_LOCAL)
-        return
-    servidor_smtp, puerto_smtp, cuenta_smtp, contraseña_smtp, remitente, destinatario = configuracion_correo()
-    cuerpo = f"""
-    <h2>Aceptacion de condiciones de SiPP</h2>
-    <p>Un usuario acepto las condiciones de uso de SiPP.</p>
-    <h3>Equipo que accedio</h3>
-    {detalles_equipo}
-    <h3>Texto aceptado</h3>
-    <pre>{html.escape(datos.terms_text)}</pre>
-    """
-    mensaje = EmailMessage()
-    mensaje["From"] = remitente
-    mensaje["To"] = destinatario
-    mensaje["Subject"] = f"SiPP: condiciones aceptadas ({datos.windows_user})"
-    mensaje.set_content("Se aceptaron las condiciones de uso de SiPP.")
-    mensaje.add_alternative(cuerpo, subtype="html")
-    try:
-        conexion_smtp = smtplib.SMTP_SSL if puerto_smtp == 465 else smtplib.SMTP
-        with conexion_smtp(servidor_smtp, puerto_smtp, timeout=15) as conexion:
-            if puerto_smtp != 465:
-                conexion.starttls()
-            conexion.login(cuenta_smtp, contraseña_smtp)
-            conexion.send_message(mensaje)
-    except (OSError, smtplib.SMTPException) as exc:
-        raise RuntimeError(f"No se pudo enviar el aviso de aceptacion: {exc}") from exc
+    cuerpo = f"Aceptacion de condiciones de SiPP.\nEquipo: {datos.device_name}\nIdentificador: {datos.installation_id}"
+    html_cuerpo = f"<h2>Aceptacion de condiciones de SiPP</h2><h3>Equipo que accedio</h3>{detalles_equipo}<pre>{html.escape(datos.terms_text)}</pre>"
+    enviar_mensaje(f"SiPP: condiciones aceptadas ({datos.windows_user})", cuerpo, html_cuerpo)
 
 
 @app.get("/health")
@@ -231,12 +193,78 @@ def root():
 @app.post("/v1/terms-acceptances")
 def registrar_aceptacion_condiciones(datos: TermsAcceptance):
     try:
-        if not MODO_LOCAL_SIN_CORREO:
-            enviar_correo_aceptacion(datos)
+        enviar_correo_aceptacion(datos)
         return {"status": "REGISTRADA", "message": "Aceptacion registrada."}
     except Exception as exc:
         logging.exception("No se pudo registrar la aceptacion de condiciones")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/admin/access-requests/{request_id}/{accion}", response_class=HTMLResponse)
+def confirmar_accion_admin(request_id: str, accion: str, token: str):
+    acciones = {
+        "aprobar": ("APROBADO", "Equipo aprobado."),
+        "rechazar": ("RECHAZADO", "Solicitud rechazada."),
+        "bloquear": ("BLOQUEADO", "Equipo bloqueado."),
+        "desbloquear": ("EXPIRADO", "Equipo desbloqueado. Puede solicitar acceso nuevamente."),
+    }
+    if accion not in acciones or not token:
+        raise HTTPException(status_code=400, detail="Accion invalida.")
+    try:
+        request_uuid = uuid.UUID(request_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Solicitud invalida.") from exc
+    with conectar() as conexion:
+        with conexion.cursor() as cursor:
+            cursor.execute(
+                """SELECT 1 FROM access_requests
+                   WHERE request_id = %s AND action_token_hash = %s
+                     AND (action_expires_at IS NULL OR action_expires_at > %s)""",
+                (request_uuid, token_hash(token), datetime.now(timezone.utc)),
+            )
+            if cursor.fetchone() is None:
+                raise HTTPException(status_code=403, detail="Enlace invalido, usado o caducado.")
+    titulo = acciones[accion][1]
+    destino = html.escape(f"/admin/access-requests/{request_id}/{accion}?token={quote(token)}", quote=True)
+    return (
+        "<html><body><h2>SiPP</h2>"
+        f"<p>{html.escape(titulo)}</p>"
+        f"<form method='post' action='{destino}'><button type='submit'>Confirmar</button></form>"
+        "</body></html>"
+    )
+
+
+@app.post("/admin/access-requests/{request_id}/{accion}", response_class=HTMLResponse)
+def ejecutar_accion_admin(request_id: str, accion: str, token: str):
+    acciones = {
+        "aprobar": ("APROBADO", "Equipo aprobado."),
+        "rechazar": ("RECHAZADO", "Solicitud rechazada."),
+        "bloquear": ("BLOQUEADO", "Equipo bloqueado."),
+        "desbloquear": ("EXPIRADO", "Equipo desbloqueado. Puede solicitar acceso nuevamente."),
+    }
+    if accion not in acciones or not token:
+        raise HTTPException(status_code=400, detail="Accion invalida.")
+    try:
+        request_uuid = uuid.UUID(request_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Solicitud invalida.") from exc
+    nuevo_estado, mensaje = acciones[accion]
+    ahora = datetime.now(timezone.utc)
+    with conectar() as conexion:
+        with conexion.cursor() as cursor:
+            cursor.execute(
+                """UPDATE access_requests
+                   SET status = %s, code_hash = CASE WHEN %s IN ('RECHAZADO', 'BLOQUEADO') THEN NULL ELSE code_hash END,
+                       updated_at = %s
+                   WHERE request_id = %s AND action_token_hash = %s
+                     AND (action_expires_at IS NULL OR action_expires_at > %s)
+                   RETURNING installation_id""",
+                (nuevo_estado, nuevo_estado, ahora, request_uuid, token_hash(token), ahora),
+            )
+            fila = cursor.fetchone()
+        if not fila:
+            raise HTTPException(status_code=403, detail="Enlace invalido, usado o caducado.")
+    return f"<html><body><h2>SiPP</h2><p>{html.escape(mensaje)}</p></body></html>"
 
 
 @app.post("/v1/access-requests")
@@ -248,11 +276,13 @@ def crear_solicitud(datos: AccessRequest):
                 cursor.execute(
                     """SELECT request_id, status, expires_at
                        FROM access_requests
-                       WHERE installation_id = %s AND status = 'PENDIENTE'
+                       WHERE installation_id = %s AND status IN ('PENDIENTE', 'BLOQUEADO')
                        ORDER BY created_at DESC LIMIT 1""",
                     (datos.installation_id,),
                 )
                 pendiente = cursor.fetchone()
+                if pendiente and pendiente[1] == "BLOQUEADO":
+                    raise HTTPException(status_code=403, detail="El equipo esta bloqueado.")
                 if pendiente and not datos.force_new and pendiente[2] > ahora:
                     return fila_a_respuesta(pendiente)
                 cursor.execute(
@@ -263,23 +293,22 @@ def crear_solicitud(datos: AccessRequest):
                 request_id = uuid.uuid4()
                 expires_at = ahora + timedelta(minutes=CODE_MINUTES)
                 code = f"{secrets.randbelow(1000000):06d}"
+                token = secrets.token_urlsafe(32)
+                action_expires_at = ahora + timedelta(minutes=ACTION_MINUTES)
                 cursor.execute(
                     """INSERT INTO access_requests
                     (request_id, installation_id, device_name, windows_user, operating_system,
-                     app_version, status, code_hash, expires_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, 'PENDIENTE', %s, %s)""",
+                     app_version, status, code_hash, expires_at, action_token_hash, action_expires_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'PENDIENTE', %s, %s, %s, %s)""",
                     (request_id, datos.installation_id, datos.device_name, datos.windows_user,
-                     datos.operating_system, datos.app_version, codigo_hash(request_id, code), expires_at),
+                     datos.operating_system, datos.app_version, codigo_hash(request_id, code), expires_at,
+                     token_hash(token), action_expires_at),
                 )
-        if not MODO_LOCAL_SIN_CORREO:
-            try:
-                enviar_correo(datos, request_id, code, expires_at)
-            except RuntimeError as exc:
-                logging.exception("No se pudo enviar el codigo por correo")
-                raise HTTPException(
-                    status_code=503,
-                    detail="No se pudo enviar el codigo por correo. Configure Brevo en el servicio.",
-                ) from exc
+        try:
+            enviar_correo(datos, request_id, code, expires_at, token)
+        except RuntimeError as exc:
+            logging.exception("No se pudo enviar el codigo por correo")
+            raise HTTPException(status_code=503, detail="No se pudo enviar el codigo por correo SMTP.") from exc
         respuesta = fila_a_respuesta((request_id, "PENDIENTE", expires_at))
         return respuesta
     except HTTPException:
@@ -307,7 +336,7 @@ def validar_codigo(request_id: str, datos: VerifyCode):
                 fila = cursor.fetchone()
                 if not fila or fila[0] != datos.installation_id:
                     raise HTTPException(status_code=404, detail="Solicitud no encontrada.")
-                if fila[1] != "PENDIENTE" or fila[4] is not None:
+                if fila[1] not in ("PENDIENTE", "APROBADO") or fila[4] is not None:
                     raise HTTPException(status_code=409, detail="El codigo ya no esta disponible.")
                 if fila[3] <= ahora:
                     cursor.execute(

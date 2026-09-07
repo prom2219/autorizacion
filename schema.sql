@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS access_requests (
         CHECK (status IN ('PENDIENTE', 'APROBADO', 'EXPIRADO')),
     code_hash TEXT,
     expires_at TIMESTAMPTZ NOT NULL,
+    action_token_hash TEXT,
+    action_expires_at TIMESTAMPTZ,
     used_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -16,3 +18,9 @@ CREATE TABLE IF NOT EXISTS access_requests (
 
 CREATE INDEX IF NOT EXISTS access_requests_installation_idx
     ON access_requests (installation_id, created_at DESC);
+
+ALTER TABLE access_requests ADD COLUMN IF NOT EXISTS action_token_hash TEXT;
+ALTER TABLE access_requests ADD COLUMN IF NOT EXISTS action_expires_at TIMESTAMPTZ;
+ALTER TABLE access_requests DROP CONSTRAINT IF EXISTS access_requests_status_check;
+ALTER TABLE access_requests ADD CONSTRAINT access_requests_status_check
+    CHECK (status IN ('PENDIENTE', 'APROBADO', 'RECHAZADO', 'BLOQUEADO', 'EXPIRADO'));
