@@ -12,7 +12,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -22,6 +22,7 @@ app = FastAPI(title="SiPP Authorization API", version="2.3.0")
 CODE_MINUTES = 10
 ACTION_MINUTES = 7 * 24 * 60
 AUTH_CODE_SECRET_LOCAL = "configure-AUTH_CODE_SECRET-en-Render"
+AUTH_API_KEY = os.getenv("AUTH_API_KEY", "").strip()
 
 
 class AccessRequest(BaseModel):
@@ -193,13 +194,22 @@ def health():
     return {"status": "ok", "service": "sipp-authorization"}
 
 
+def validar_api_key(api_key: str | None):
+    if not AUTH_API_KEY:
+        logging.error("AUTH_API_KEY no esta configurada.")
+        raise HTTPException(status_code=503, detail="La API no esta configurada.")
+    if not api_key or not hmac.compare_digest(api_key, AUTH_API_KEY):
+        raise HTTPException(status_code=401, detail="API key invalida.")
+
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "sipp-authorization", "message": "Servidor activo."}
 
 
 @app.post("/v1/terms-acceptances")
-def registrar_aceptacion_condiciones(datos: TermsAcceptance):
+def registrar_aceptacion_condiciones(datos: TermsAcceptance, x_api_key: str | None = Header(default=None)):
+    validar_api_key(x_api_key)
     try:
         enviar_correo_aceptacion(datos)
         return {"status": "REGISTRADA", "message": "Aceptacion registrada."}
@@ -276,7 +286,8 @@ def ejecutar_accion_admin(request_id: str, accion: str, token: str):
 
 
 @app.post("/v1/access-requests")
-def crear_solicitud(datos: AccessRequest):
+def crear_solicitud(datos: AccessRequest, x_api_key: str | None = Header(default=None)):
+    validar_api_key(x_api_key)
     ahora = datetime.now(timezone.utc)
     try:
         with conectar() as conexion:
@@ -327,7 +338,8 @@ def crear_solicitud(datos: AccessRequest):
 
 
 @app.post("/v1/access-requests/{request_id}/verify")
-def validar_codigo(request_id: str, datos: VerifyCode):
+def validar_codigo(request_id: str, datos: VerifyCode, x_api_key: str | None = Header(default=None)):
+    validar_api_key(x_api_key)
     try:
         request_uuid = uuid.UUID(request_id)
     except ValueError as exc:
