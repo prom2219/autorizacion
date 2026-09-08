@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
+from email.utils import parseaddr
 from urllib.request import Request, urlopen
 
 import psycopg
@@ -95,25 +96,28 @@ def enlace_accion(request_id, token, accion):
 
 
 def enviar_mensaje(asunto, texto, html_cuerpo):
-    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    api_key = os.getenv("BREVO_API_KEY", "").strip()
     remitente = os.getenv("MAIL_FROM", "").strip()
     destinatario = os.getenv("MAIL_TO", "").strip()
     if not api_key or not remitente or not destinatario:
-        raise RuntimeError("Configure RESEND_API_KEY, MAIL_FROM y MAIL_TO.")
+        raise RuntimeError("Configure BREVO_API_KEY, MAIL_FROM y MAIL_TO.")
+    nombre_remitente, correo_remitente = parseaddr(remitente)
+    if not correo_remitente:
+        raise RuntimeError("MAIL_FROM debe contener una direccion de correo valida.")
     cuerpo = json.dumps(
         {
-            "from": remitente,
-            "to": [destinatario],
+            "sender": {"name": nombre_remitente or "SiPP", "email": correo_remitente},
+            "to": [{"email": destinatario}],
             "subject": asunto,
-            "text": texto,
-            "html": html_cuerpo,
+            "textContent": texto,
+            "htmlContent": html_cuerpo,
         }
     ).encode("utf-8")
     solicitud = Request(
-        "https://api.resend.com/emails",
+        "https://api.brevo.com/v3/smtp/email",
         data=cuerpo,
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "api-key": api_key,
             "Content-Type": "application/json",
             "Accept": "application/json",
         },
@@ -122,15 +126,15 @@ def enviar_mensaje(asunto, texto, html_cuerpo):
     try:
         with urlopen(solicitud, timeout=20) as respuesta:
             if respuesta.status not in (200, 201):
-                raise RuntimeError(f"Resend devolvio HTTP {respuesta.status}.")
+                raise RuntimeError(f"Brevo devolvio HTTP {respuesta.status}.")
     except HTTPError as exc:
         try:
             detalle = json.loads(exc.read().decode("utf-8")).get("message", "")
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             detalle = ""
-        raise RuntimeError(f"Resend devolvio HTTP {exc.code}: {detalle}") from exc
+        raise RuntimeError(f"Brevo devolvio HTTP {exc.code}: {detalle}") from exc
     except (URLError, TimeoutError, OSError, ValueError) as exc:
-        raise RuntimeError(f"No se pudo contactar la API de Resend: {exc}") from exc
+        raise RuntimeError(f"No se pudo contactar la API de Brevo: {exc}") from exc
 
 
 def fila_a_respuesta(fila):
